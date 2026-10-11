@@ -5,6 +5,8 @@ use tools::AppState;
 use tauri::State;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use walkdir::WalkDir;
+use keyring::Entry;
 
 
 const MAX_ACTIVE_MESSAGES: usize = 20; // keep last 20 messages in context
@@ -103,6 +105,18 @@ fn tool_definitions() -> Value {
         },
         "required": ["path"]
     }
+    },
+    {
+    "name": "rename_file",
+    "description": "Rename a file or folder. Provide the full path and the new name (just the name, not a full path).",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "Full absolute path to the file or folder to rename." },
+            "new_name": { "type": "string", "description": "The new name (e.g., 'resume_updated.txt', not a full path)." }
+        },
+        "required": ["path", "new_name"]
+    }
     }
     
     ])
@@ -117,6 +131,56 @@ fn get_conversation_file() -> Result<PathBuf, String> {
     let roslin_dir = data_dir.join("Roslin");
     std::fs::create_dir_all(&roslin_dir).map_err(|e| e.to_string())?;
     Ok(roslin_dir.join("conversation.json"))
+}
+
+
+
+#[tauri::command]
+async fn set_api_key(key: String) -> Result<(), String> {
+   if key.trim().is_empty() {
+        return Err("API key cannot be empty".to_string());
+    }
+    
+    // Validate the key by making a test API call
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 10,
+            "messages": [{ "role": "user", "content": "test" }],
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    // Check if the API call succeeded
+    if !res.status().is_success() {
+        let status = res.status();
+        if status == 401 {
+            return Err("Invalid API key. Check that your key is correct.".to_string());
+        }
+        return Err(format!("API error: {}", status));
+    }
+
+    // Only save if validation passed
+    Entry::new("Roslin", "anthropic_api_key")
+        .map_err(|e| e.to_string())?
+        .set_password(&key)
+        .map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+#[tauri::command]
+fn get_api_key() -> Result<String, String> {
+    Entry::new("Roslin", "anthropic_api_key")
+        .map_err(|e| e.to_string())?
+        .get_password()
+        .map_err(|e| e.to_string())
 }
 
 
@@ -180,7 +244,8 @@ async fn claude_call(
     human_confirmed: bool,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|e| e.to_string())?;
+    //let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|e| e.to_string())?;
+    let api_key = get_api_key()?; // Retrieve from Credential Manager instead of env var
     let client = reqwest::Client::new();
     let mut messages: Value = serde_json::from_str(&messages).map_err(|e| e.to_string())?;
 
@@ -238,6 +303,10 @@ async fn claude_call(
                     input["path"].as_str().unwrap_or(""),
                     input["content"].as_str().unwrap_or(""),
                 ),
+                "rename_file" => tools::rename_file(
+                    input["path"].as_str().unwrap_or(""),
+                    input["new_name"].as_str().unwrap_or(""),
+                ),
                 "read_file" => tools::read_file(input["path"].as_str().unwrap_or("")),
                 "find_files" => tools::find_files(
                    input["keywords"]
@@ -254,24 +323,93 @@ async fn claude_call(
                     input["directory"].as_str().unwrap_or("."),
                     input["recursive"].as_bool().unwrap_or(false),
                 ),
-                "move_files" => tools::move_files(
-                    input["paths"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect(),
-                    input["destination_folder"].as_str().unwrap_or(""),
-                ),
-                "zip_files" => tools::zip_files(
-                    input["paths"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect(),
-                    input["output_zip_path"].as_str().unwrap_or(""),
-                ),
-                "stage_deletion" => tools::stage_deletion(
-                    &state,
-                    input["paths"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect(),
-                    input["reason"].as_str().unwrap_or("").to_string(),
-                ),
-                "execute_staged_deletion" => tools::execute_staged_deletion(
-                    &state,
-                    input["stage_id"].as_str().unwrap_or(""),
-                    human_confirmed,
-                ),
+                "move_files" => {
+                    let paths = if let Some(arr) = input["paths"].as_array() {
+                        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                    } else if let Some(str_val) = input["paths"].as_str() {
+                        // Try parsing as-is first
+                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(str_val) {
+                            parsed
+                        } else {
+                            // If parsing fails, try fixing unescaped backslashes
+                            let fixed = str_val.replace("\\", "\\\\");
+                            serde_json::from_str::<Vec<String>>(&fixed).unwrap_or_default()
+                        }
+                    } else {
+                        vec![]
+                    };
+                    
+                    tools::move_files(
+                        paths,
+                        input["destination_folder"].as_str().unwrap_or(""),
+                    )
+                },
+                "zip_files" => {
+                    let paths = if let Some(arr) = input["paths"].as_array() {
+                        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                    } else if let Some(str_val) = input["paths"].as_str() {
+                        // Handle stringified JSON array
+                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(str_val) {
+                            parsed
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    };
+                    
+                    tools::zip_files(
+                        paths,
+                        input["output_zip_path"].as_str().unwrap_or(""),
+                    )
+                },
+                "stage_deletion" => {
+                    let paths = if let Some(arr) = input["paths"].as_array() {
+                        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                    } else if let Some(str_val) = input["paths"].as_str() {
+                        // Handle stringified JSON array
+                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(str_val) {
+                            parsed
+                        } else {
+                            // Fix unescaped backslashes
+                            let fixed = str_val.replace("\\", "\\\\");
+                            serde_json::from_str::<Vec<String>>(&fixed).unwrap_or_default()
+                        }
+                    } else {
+                        vec![]
+                    };
+                    
+                    tools::stage_deletion(
+                        &state,
+                        paths,
+                        input["reason"].as_str().unwrap_or("").to_string(),
+                    )
+                },
+                "execute_staged_deletion" => {
+
+                    let paths = if let Some(arr) = input["paths"].as_array() {
+                        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                    } else if let Some(str_val) = input["paths"].as_str() {
+                        // Handle stringified JSON array
+                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(str_val) {
+                            parsed
+                        } else {
+                            // Fix unescaped backslashes
+                            let fixed = str_val.replace("\\", "\\\\");
+                            serde_json::from_str::<Vec<String>>(&fixed).unwrap_or_default()
+                        }
+                    } else {
+                        vec![]
+                    };
+                    
+                    
+                    tools::execute_staged_deletion(
+                        &state,
+                        input["stage_id"].as_str().unwrap_or(""),
+                        human_confirmed,
+                    )
+            
+                },
                 _ => json!({ "error": format!("Unknown tool: {}", name) }),
             };
 
@@ -288,14 +426,33 @@ async fn claude_call(
         }));
     }
 }
-
+#[tauri::command]
+fn debug_find(directory: &str) -> Value {
+    let mut dirs = vec![];
+    let mut files = vec![];
+    
+    for entry in WalkDir::new(directory).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.file_type().is_dir() {
+            dirs.push(name);
+        } else {
+            files.push(name);
+        }
+    }
+    
+    json!({ 
+        "directories": dirs,
+        "directory_count": dirs.len(),
+        "file_count": files.len(),
+    })
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![claude_call, load_conversation, save_conversation, clear_conversation])
+        .invoke_handler(tauri::generate_handler![claude_call, load_conversation, save_conversation, clear_conversation, debug_find, set_api_key, get_api_key])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

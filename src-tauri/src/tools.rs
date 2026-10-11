@@ -99,13 +99,28 @@ pub fn zip_files(paths: Vec<String>, output_zip_path: &str) -> Value {
     let mut included = vec![];
 
     for p in &paths {
-        let path = std::path::Path::new(p);
+        // Normalize forward slashes to backslashes
+        let normalized = p.replace("/", "\\");
+        let path = std::path::Path::new(&normalized);
+        
         if path.is_file() {
             if let Ok(contents) = fs::read(path) {
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 let _ = zip_writer.start_file(&name, options);
                 let _ = zip_writer.write_all(&contents);
                 included.push(p.clone());
+            }
+        } else if path.is_dir() {
+            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file() {
+                    if let Ok(contents) = fs::read(entry.path()) {
+                        let relative_path = entry.path().strip_prefix(path).unwrap_or(entry.path());
+                        let zip_path = relative_path.to_string_lossy().replace("\\", "/");
+                        let _ = zip_writer.start_file(&zip_path, options);
+                        let _ = zip_writer.write_all(&contents);
+                        included.push(entry.path().to_string_lossy().to_string());
+                    }
+                }
             }
         }
     }
@@ -125,6 +140,12 @@ pub fn create_file(path: &str, content: &str) -> Value {
 }
 
 pub fn find_files(keywords: Vec<String>, directories: Vec<String>, recursive: bool) -> Value {
+
+    eprintln!("DEBUG find_files called with:");
+    eprintln!("  keywords: {:?}", keywords);
+    eprintln!("  directories: {:?}", directories);
+    eprintln!("  recursive: {}", recursive);
+
     if directories.is_empty() {
         return json!({ "error": "No directories provided to search." });
     }
@@ -226,6 +247,33 @@ pub fn stage_deletion(state: &AppState, paths: Vec<String>, reason: String) -> V
     })
 }
 
+pub fn rename_file(path: &str, new_name: &str) -> Value {
+    if path.is_empty() {
+        return json!({ "error": "Path cannot be empty." });
+    }
+    if new_name.is_empty() {
+        return json!({ "error": "New name cannot be empty." });
+    }
+
+    let old_path = std::path::Path::new(path);
+    if !old_path.exists() {
+        return json!({ "error": format!("Path does not exist: {}", path) });
+    }
+
+    // Construct new path with same parent directory
+    let parent = old_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let new_path = parent.join(new_name);
+
+    match std::fs::rename(old_path, &new_path) {
+        Ok(_) => json!({
+            "renamed": true,
+            "old_path": path,
+            "new_path": new_path.to_string_lossy(),
+        }),
+        Err(e) => json!({ "error": format!("Failed to rename: {}", e) }),
+    }
+}
+
 pub fn list_staged_deletions(state: &AppState) -> Value {
     let staged = state.staged_deletions.lock().unwrap();
     //json!({ "staged": *staged as *const _ }); // placeholder replaced below
@@ -236,7 +284,7 @@ pub fn list_staged_deletions(state: &AppState) -> Value {
 }
 
 pub fn execute_staged_deletion(state: &AppState, stage_id: &str, human_confirmed: bool) -> Value {
-    if !human_confirmed {
+   if !human_confirmed {
         return json!({ "error": "Execution blocked: no explicit human confirmation for this turn." });
     }
 
@@ -248,7 +296,14 @@ pub fn execute_staged_deletion(state: &AppState, stage_id: &str, human_confirmed
     let mut deleted = vec![];
     let mut errors = vec![];
     for p in batch.paths {
-        match fs::remove_file(&p) {
+        let path = std::path::Path::new(&p);
+        let result = if path.is_dir() {
+            fs::remove_dir_all(&p)  // Remove directory and contents
+        } else {
+            fs::remove_file(&p)     // Remove file
+        };
+        
+        match result {
             Ok(_) => deleted.push(p),
             Err(e) => errors.push(format!("{}: {}", p, e)),
         }

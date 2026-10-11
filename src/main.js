@@ -2,7 +2,7 @@ const { invoke } = window.__TAURI__.core;
 let userText;
 let roslinResponse;
 
-const SYSTEM_PROMPT = "You are Roslin, a natural-language file management assistant embedded on the user's Windows computer (Assume the Windows username is \"Kamsi\". This is a placeholder because you are a v1 prototype).\n\nRules you must always follow:\n- For any request follow Windows' file management conventions.\n- For any request that involves deleting files, you must first call stage_deletion (never execute_staged_deletion directly).\n- After staging, summarize exactly which files would be deleted and why, then ask the user to confirm in plain language.\n- Only call execute_staged_deletion if the user's most recent message is a clear, explicit confirmation (e.g. \"yes\", \"confirm\", \"go ahead and delete stage-1\").\n- If a user's instruction is ambiguous (e.g. which folder, which files), ask a clarifying question instead of guessing. \n- For content-based searches (e.g., \"find the file with my phone number\"), use find_files first to get candidates by filename, then read_file on the promising matches. \n- Avoid calling list_files on large directories. Use find_files with specific keywords first to narrow down results. \n- If you need more info about a file, call read_file on it specifically, not list_files on the whole directory.\n- Keep responses short and concrete (do not use emojis): state what you found, what you're about to do, and what you actually did.";
+const SYSTEM_PROMPT = "You are Roslin, a natural-language file management assistant embedded on the user's Windows computer (Do not assume the Windows username unless known). This is a placeholder because you are a v1 prototype).\n\nRules you must always follow:\n- For any request follow Windows' file management conventions.\n- For any request that involves deleting files, you must first call stage_deletion (never execute_staged_deletion directly).\n- After staging, summarize exactly which files would be deleted and why, then ask the user to confirm in plain language.\n- Only call execute_staged_deletion if the user's most recent message is a clear, explicit confirmation (e.g. \"yes\", \"confirm\", \"go ahead and delete stage-1\").\n- If a user's instruction is ambiguous (e.g. which folder, which files), ask a clarifying question instead of guessing. \n- For content-based searches (e.g., \"find the file with my phone number\"), use find_files first to get candidates by filename, then read_file on the promising matches. \n- Avoid calling list_files on large directories. Use find_files with specific keywords first to narrow down results. \n- If you need more info about a file, call read_file on it specifically, not list_files on the whole directory.\n- Keep responses short and concrete (do not use emojis): state what you found, what you're about to do, and what you actually did.";
 
 let conversation = [];
 
@@ -19,7 +19,7 @@ async function loadConversation() {
         }
       }
     } else {
-      roslinResponse.textContent = "Hi, I'm Roslin. What would you like me to help you with?";
+      roslinResponse.textContent = "Hi, I'm Roslin. What is your Windows username and what would you like me to help you with?";
     }
   } catch (error) {
     console.error("Error loading conversation:", error);
@@ -40,11 +40,44 @@ async function clearConversation() {
   try {
     await invoke("clear_conversation");
     conversation = []; // Clear in-memory conversation too
-    roslinResponse.textContent = "Conversation cleared. What would you like me to help you with?";
+    roslinResponse.textContent = "Conversation cleared. What is your Windows username and what would you like me to help you with?";
   } catch (error) {
     console.error("Error clearing conversation:", error);
   }
 }
+
+async function saveOrGetApiKey() {
+  const keyInput = document.querySelector("#api_input");
+  const key = keyInput.value.trim();
+  
+  // If new key is entered in the input, save it
+  if (key) {
+    try {
+      await invoke("set_api_key", { key });
+      keyInput.value = ""; // Clear input after saving
+      return true;
+    } catch (error) {
+      console.log("this should return false")
+      alert("Error saving API key: " + error);
+      return false;
+    }
+  }
+  
+  // Otherwise, try to retrieve the existing stored key
+  try {
+    const existingKey = await invoke("get_api_key");
+    if (existingKey) {
+      return true; // Key exists and is valid
+    }
+  } catch (error) {
+    // Key retrieval failed
+  }
+  
+  // No key found or invalid
+  alert("No valid API key found. Please enter your Anthropic API key.");
+  return false;
+}
+
 
 async function claude_call(userText) {
   conversation.push({ role: "user", content: userText });
@@ -72,8 +105,11 @@ async function claude_call(userText) {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  const temp = await invoke("debug_find", { directory: "C:\\Users\\Kamsi\\Downloads" });
+  console.log(temp);
   userText = document.querySelector("#greet-input");
   roslinResponse = document.querySelector("#greet-msg");
+  
   
   await loadConversation();
   
@@ -82,9 +118,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     await clearConversation();
   });
 
-  document.querySelector("#greet-form").addEventListener("submit", (e) => {
+  document.querySelector("#greet-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    claude_call(userText.value);
-    userText.value = "";
+    const hasValidKey = await saveOrGetApiKey();
+    //console.log("hasValidKey: " + hasValidKey);
+    if (hasValidKey) {
+      claude_call(userText.value);
+      userText.value = "";
+    }
   });
 });
